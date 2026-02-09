@@ -1,0 +1,48 @@
+trigger: none
+pr: none
+
+parameters:
+- name: repoUrl
+  displayName: 'Git Repo URL (paste full URL)'
+  type: string
+  default: ''   # empty => forces user to type during manual run
+
+- name: branch
+  displayName: 'Branch to checkout'
+  type: string
+  default: ''
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- checkout: self
+  fetchDepth: 1
+
+- bash: |
+    set -euo pipefail
+    cd "$(Build.SourcesDirectory)"
+
+    if [ -z "${{ parameters.repoUrl }}" ]; then
+      echo "ERROR: repoUrl parameter is empty. Provide a repo URL when running the pipeline."
+      exit 1
+    fi
+
+    if [ -z "${{ parameters.branch }}" ]; then
+      echo "ERROR: branch parameter is empty. Provide a branch when running the pipeline."
+      exit 1
+    fi
+
+    rm -rf target
+    echo "Cloning: ${{ parameters.repoUrl }}"
+    echo "Branch:  ${{ parameters.branch }}"
+    git clone --depth 1 --branch "${{ parameters.branch }}" "${{ parameters.repoUrl }}" target
+
+    chmod +x migration.sh
+    bash migration.sh "$(Build.SourcesDirectory)/target"
+  displayName: "Clone repo and run migration (commit & push)"
+  env:
+    # Secret PAT for GitHub push (Azure DevOps recommends secret vars over CLI args) [1](https://www.geeksforgeeks.org/python/how-to-define-and-call-a-function-in-python/)
+    GITHUB_TOKEN: $(GITHUB_TOKEN)
+    # Needed so the script knows which branch to push to
+    TARGET_BRANCH: ${{ parameters.branch }}
