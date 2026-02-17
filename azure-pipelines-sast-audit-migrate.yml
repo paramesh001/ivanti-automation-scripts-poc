@@ -1,0 +1,166 @@
+trigger: none
+pr: none
+
+parameters:
+  - name: mode
+    type: string
+    displayName: "Mode"
+    default: "audit"
+    values:
+      - audit
+      - dry-run
+      - apply
+      - rollback
+
+  - name: targetRepoUrl
+    type: string
+    displayName: "Target GitHub repo HTTPS URL"
+    default: ""
+
+  - name: targetBranches
+    type: string
+    displayName: "Branches (comma-separated). Example: main,develop,release/1.0"
+    default: "main"
+
+  - name: outputCsvName
+    type: string
+    displayName: "Output CSV filename"
+    default: "synopsys_blackduck_report.csv"
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  # 1) Checkout THIS repo (the repo that contains the migration script)
+  - checkout: self
+    fetchDepth: 1
+
+  # 2) Run script across validated branches (sequential)
+  - bash: |
+      set -euo pipefail
+
+      cd "$(Build.SourcesDirectory)"
+
+      MODE="${{ parameters.mode }}"
+      TARGET_REPO_URL="${{ parameters.targetRepoUrl }}"
+      TARGET_BRANCHES="${{ parameters.targetBranches }}"
+      OUT_CSV="${{ parameters.outputCsvName }}"
+
+      if [[ -z "$TARGET_REPO_URL" ]]; then
+        echo "[ERROR] targetRepoUrl is empty."
+        exit 1
+      fi
+
+      echo "Mode : $MODE"
+      echo "Target Repo : $TARGET_REPO_URL"
+      echo "Branches : $TARGET_BRANCHES"
+      echo "CSV : $OUT_CSV"
+      echo
+
+      # ---- Script in THIS repo ----
+      # Update this filename if you rename the script in your repo
+      SCRIPT="./synopsys_to_blackduck_migrate_v6_7_4.sh"
+      if [[ ! -f "$SCRIPT" ]]; then
+        echo "[ERROR] Script not found: $SCRIPT"
+        echo "       Commit the script as a .sh file in this repo at that path, or update SCRIPT variable."
+        exit 1
+      fi
+      chmod +x "$SCRIPT"
+
+      # Fresh artifacts each run
+      rm -f "$OUT_CSV"
+      rm -rf artifacts
+      mkdir -p artifacts/csv
+
+      # Validate branches exist on remote
+      IFS=',' read -r -a BRANCHES <<< "$TARGET_BRANCHES"
+
+      echo "Validating branches exist on remote..."
+      VALID_BRANCHES=()
+      for BR in "${BRANCHES[@]}"; do
+        BR="$(echo "$BR" | xargs)"
+        [[ -z "$BR" ]] && continue
+
+        if git ls-remote --heads "$TARGET_REPO_URL" "$BR" | grep -q "refs/heads/$BR"; then
+          echo "[OK] $BR"
+          VALID_BRANCHES+=("$BR")
+        else
+          echo "[WARN] $BR not found on remote. Skipping."
+        fi
+      done
+
+      if [[ ${#VALID_BRANCHES[@]} -eq 0 ]]; then
+        echo "[ERROR] None of the provided branches exist on remote."
+        exit 1
+      fi
+
+      echo
+      echo "Branches to process: ${VALID_BRANCHES[*]}"
+      echo
+
+      # Git identity for apply/rollback commits (safe for all modes)
+      git config --global user.email "azure-pipelines@local"
+      git config --global user.name "azure-pipelines"
+
+      # Choose clone depth (rollback may need more history)
+      CLONE_DEPTH="--depth 50"
+      if [[ "$MODE" == "rollback" ]]; then
+        CLONE_DEPTH=""  # full clone
+      fi
+
+      for BR in "${VALID_BRANCHES[@]}"; do
+        echo "===================================================="
+        echo "Processing branch: $BR"
+        echo "===================================================="
+
+        rm -rf target-repo
+
+        # Clone branch
+        if [[ -n "$CLONE_DEPTH" ]]; then
+          git clone $CLONE_DEPTH --single-branch --branch "$BR" "$TARGET_REPO_URL" target-repo
+        else
+          git clone --single-branch --branch "$BR" "$TARGET_REPO_URL" target-repo
+        fi
+
+        # Ensure we have remote/tags info
+        (cd target-repo && git fetch --prune --tags || true)
+
+        # Export runtime vars expected by the script
+        export ROOT="target-repo"
+        export MODE="$MODE"
+        export OUT_CSV="$OUT_CSV"
+
+        # For apply/rollback we intend to push back changes
+        if [[ "$MODE" == "apply" || "$MODE" == "rollback" ]]; then
+          export COMMIT=1
+          export PUSH=1
+        else
+          export COMMIT=0
+          export PUSH=0
+        fi
+
+        # Run
+        bash -x "$SCRIPT"
+        echo
+      done
+
+      # Publish CSV artifact
+      cp -f "$OUT_CSV" "artifacts/csv/$OUT_CSV"
+
+      echo "===================================================="
+      echo "CSV preview:"
+      echo "===================================================="
+      head -n 50 "$OUT_CSV" || true
+    displayName: "Run Synopsys → Black Duck migration (v6_7)"
+    env:
+      # Required ONLY when mode=apply or rollback (safe to set always)
+      GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+  # 3) Publish CSV always
+  - task: PublishPipelineArtifact@1
+    condition: always()
+    inputs:
+      targetPath: '$(Build.SourcesDirectory)/artifacts/csv'
+      artifact: 'synopsys-blackduck-report-csv'
+      publishLocation: 'pipeline'
+    displayName: "Publish CSV artifact (always)"
